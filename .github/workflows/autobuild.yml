@@ -19,9 +19,16 @@
 on:
   workflow_dispatch:
     inputs:
-      build_all_targets:
-        type: boolean
-        description: 'Build all targets (instead of just the main platforms)'
+      build_target:
+        type: choice
+        description: 'Select which target set to build for this manual run'
+        default: main
+        options:
+          - main
+          - all
+          - linux-amd64
+          - linux-armhf
+          - linux-arm64
   push:
     tags:
       - "r*"
@@ -68,6 +75,8 @@ jobs:
       tag_name:                     ${{ steps.get-build-vars.outputs.RELEASE_TAG }}
       build_version:                ${{ steps.get-build-vars.outputs.BUILD_VERSION }}
       build_all_targets:            ${{ steps.decide-build-targets.outputs.build_all_targets }}
+      build_target:                 ${{ steps.decide-build-targets.outputs.build_target }}
+      build_configs:                ${{ steps.select-build-matrix.outputs.build_configs }}
     env:
       release_changelog_path:       ./.github_release_changelog.md
     # Set permissions. We need write permissions to content for creating/removing the release
@@ -112,34 +121,47 @@ jobs:
         id:                         decide-build-targets
         env:
           GITHUB_TOKEN:             ${{ secrets.GITHUB_TOKEN }}
-          INPUT_BUILD_ALL_TARGETS:  ${{ github.event.inputs.build_all_targets }}
+          INPUT_BUILD_TARGET:       ${{ github.event.inputs.build_target }}
           PR_NUMBER:                ${{ github.event.number }}
           PR_BASE:                  ${{ github.event.pull_request.base.sha }}
           PR_HEAD:                  ${{ github.event.pull_request.head.sha }}
         run:                        |
           set -eu
-          build_all_targets() {
-            echo "build_all_targets=${1}" >> $GITHUB_OUTPUT
-            echo "Building for all targets? Result: ${1}"
+          set_build_target() {
+            local build_target="${1}"
+            local build_all_targets='false'
+            if [[ "${build_target}" == 'all' ]]; then
+              build_all_targets='true'
+            fi
+
+            echo "build_target=${build_target}" >> $GITHUB_OUTPUT
+            echo "build_all_targets=${build_all_targets}" >> $GITHUB_OUTPUT
+            echo "Selected build target: ${build_target}"
             exit 0
           }
 
           handle_push() {
             if [[ "${GITHUB_REF}" == "refs/tags/"* ]]; then
               echo 'Triggered by a tag push, building all targets'
-              build_all_targets 'true'
+              set_build_target 'all'
             fi
             if [[ "${GITHUB_REF}" =~ ^refs/heads/autobuild ]]; then
               echo 'Triggered by a push to an autobuild* branch, building all targets'
-              build_all_targets 'true'
+              set_build_target 'all'
             fi
           }
 
           handle_workflow_dispatch() {
-            if [[ "${INPUT_BUILD_ALL_TARGETS}" == 'true' ]]; then
-              echo 'Triggered by manual run with "Build all targets" checkbox set'
-              build_all_targets 'true'
-            fi
+            case "${INPUT_BUILD_TARGET:-main}" in
+              main|all|linux-amd64|linux-armhf|linux-arm64)
+                echo "Triggered by manual run for target ${INPUT_BUILD_TARGET:-main}"
+                set_build_target "${INPUT_BUILD_TARGET:-main}"
+                ;;
+              *)
+                echo "Unsupported workflow_dispatch build_target: ${INPUT_BUILD_TARGET}" >&2
+                exit 1
+                ;;
+            esac
           }
 
           handle_pull_request() {
@@ -149,7 +171,7 @@ jobs:
             }
             if pr_body_contains_magic_string; then
               echo 'Triggered by a PR with magic AUTOBUILD: string, building all targets'
-              build_all_targets 'true'
+              set_build_target 'all'
             fi
 
             pr_contains_build_changes() {
@@ -159,7 +181,7 @@ jobs:
             }
             if pr_contains_build_changes; then
               echo 'Triggered by a PR with build- or platform-specific changes, building all targets'
-              build_all_targets 'true'
+              set_build_target 'all'
             fi
           }
 
@@ -175,8 +197,119 @@ jobs:
               ;;
           esac
 
-          echo 'default case, not building all targets'
-          build_all_targets 'false'
+          echo 'Default case, building main targets'
+          set_build_target 'main'
+
+      - name:                       Select build matrix
+        id:                         select-build-matrix
+        env:
+          BUILD_TARGET:             ${{ steps.decide-build-targets.outputs.build_target }}
+        run:                        |
+          python3 <<'PY'
+          import json
+          import os
+
+          build_target = os.environ["BUILD_TARGET"]
+          configs = [
+              {
+                  "config_name": "Android .apk (artifact+codeQL)",
+                  "target_os": "android",
+                  "target_key": "android",
+                  "building_on_os": "ubuntu-22.04",
+                  "base_command": "./.github/autobuild/android.sh",
+                  "run_codeql": True,
+                  "is_main_build_target": True,
+                  "checkout_fetch_depth": "0",
+              },
+              {
+                  "config_name": "Linux .deb amd64 (artifacts+codeQL)",
+                  "target_os": "linux",
+                  "target_key": "linux-amd64",
+                  "building_on_os": "ubuntu-22.04",
+                  "building_container": "ubuntu:20.04",
+                  "base_command": "./.github/autobuild/linux_deb.sh",
+                  "run_codeql": True,
+                  "is_main_build_target": True,
+              },
+              {
+                  "config_name": "Linux .deb armhf (artifacts)",
+                  "target_os": "linux",
+                  "target_key": "linux-armhf",
+                  "building_on_os": "ubuntu-22.04-arm",
+                  "building_container": "ubuntu:20.04",
+                  "base_command": "TARGET_ARCH=armhf ./.github/autobuild/linux_deb.sh",
+                  "run_codeql": False,
+              },
+              {
+                  "config_name": "Linux .deb arm64 (artifacts)",
+                  "target_os": "linux",
+                  "target_key": "linux-arm64",
+                  "building_on_os": "ubuntu-22.04-arm",
+                  "building_container": "ubuntu:20.04",
+                  "base_command": "TARGET_ARCH=arm64 ./.github/autobuild/linux_deb.sh",
+                  "run_codeql": False,
+              },
+              {
+                  "config_name": "MacOS (artifacts)",
+                  "target_os": "macos",
+                  "target_key": "macos",
+                  "building_on_os": "macos-15",
+                  "base_command": 'QT_VERSION=6.10.2 SIGN_IF_POSSIBLE=1 TARGET_ARCHS="x86_64 arm64" ./.github/autobuild/mac.sh',
+                  "run_codeql": False,
+                  "xcode_version": "16.3.0",
+                  "is_main_build_target": True,
+              },
+              {
+                  "config_name": "MacOS Legacy (artifacts+CodeQL)",
+                  "target_os": "macos",
+                  "target_key": "macos-legacy",
+                  "building_on_os": "macos-15-intel",
+                  "base_command": "QT_VERSION=5.15.2 SIGN_IF_POSSIBLE=0 ARTIFACT_SUFFIX=_legacy ./.github/autobuild/mac.sh",
+                  "run_codeql": True,
+                  "xcode_version": "16.3.0",
+                  "is_main_build_target": True,
+              },
+              {
+                  "config_name": "iOS (artifacts)",
+                  "target_os": "ios",
+                  "target_key": "ios",
+                  "building_on_os": "macos-15",
+                  "base_command": "QT_VERSION=5.15.2 ./.github/autobuild/ios.sh",
+                  "run_codeql": False,
+                  "xcode_version": "26.2",
+              },
+              {
+                  "config_name": "Windows (artifact+codeQL)",
+                  "target_os": "windows",
+                  "target_key": "windows",
+                  "building_on_os": "windows-2022",
+                  "base_command": "powershell .\\.github\\autobuild\\windows.ps1 -Stage",
+                  "run_codeql": True,
+                  "is_main_build_target": True,
+              },
+              {
+                  "config_name": "Windows JACK (artifact)",
+                  "target_os": "windows",
+                  "target_key": "windows-jack",
+                  "building_on_os": "windows-2022",
+                  "base_command": "powershell .\\.github\\autobuild\\windows.ps1 -BuildOption jackonwindows -Stage",
+                  "run_codeql": False,
+              },
+          ]
+
+          if build_target == "all":
+              selected = configs
+          elif build_target == "main":
+              selected = [config for config in configs if config.get("is_main_build_target")]
+          else:
+              selected = [config for config in configs if config["target_key"] == build_target]
+
+          if not selected:
+              raise SystemExit(f"No build configs matched build_target={build_target!r}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"build_configs={json.dumps(selected, separators=(',', ':'))}\n")
+          PY
 
 
   release_assets:
@@ -190,94 +323,7 @@ jobs:
     strategy:
       fail-fast:                    false
       matrix:
-        # Think of this like a foreach loop. Basically runs the steps with every combination of
-        # the contents of this.
-        config:
-          - config_name:            Android .apk (artifact+codeQL)
-            target_os:              android
-            building_on_os:         ubuntu-22.04
-            base_command:           ./.github/autobuild/android.sh
-            run_codeql:             true
-            is_main_build_target:   true
-            # Jamulus.pro needs to count git history length for android versioning:
-            checkout_fetch_depth:   '0'
-
-          - config_name:            Linux .deb amd64 (artifacts+codeQL)
-            target_os:              linux
-            building_on_os:         ubuntu-22.04
-            building_container:     ubuntu:20.04
-            base_command:           ./.github/autobuild/linux_deb.sh
-            run_codeql:             true
-            is_main_build_target:   true
-
-          - config_name:            Linux .deb armhf (artifacts)
-            target_os:              linux
-            building_on_os:         ubuntu-22.04-arm
-            building_container:     ubuntu:20.04
-            base_command:           TARGET_ARCH=armhf ./.github/autobuild/linux_deb.sh
-            run_codeql:             false
-
-          - config_name:            Linux .deb arm64 (artifacts)
-            target_os:              linux
-            building_on_os:         ubuntu-22.04-arm
-            building_container:     ubuntu:20.04
-            base_command:           TARGET_ARCH=arm64 ./.github/autobuild/linux_deb.sh
-            run_codeql:             false
-
-          - config_name:            MacOS (artifacts)
-            target_os:              macos
-            building_on_os:         macos-15
-            base_command:           QT_VERSION=6.10.2 SIGN_IF_POSSIBLE=1 TARGET_ARCHS="x86_64 arm64" ./.github/autobuild/mac.sh
-            # Disable CodeQL on mac as it interferes with signing the binaries (signing hangs, see #2563 and #2564)
-            run_codeql:             false
-            xcode_version:          16.3.0
-            is_main_build_target:   true
-
-          # Reminder: If Legacy is removed, be sure to add a dedicated job for CodeQL again.
-          - config_name:            MacOS Legacy (artifacts+CodeQL)
-            target_os:              macos
-            building_on_os:         macos-15-intel
-            base_command:           QT_VERSION=5.15.2 SIGN_IF_POSSIBLE=0 ARTIFACT_SUFFIX=_legacy ./.github/autobuild/mac.sh
-            # Enable CodeQL on mac legacy as this version does not get signed
-            run_codeql:             true
-            # macos-15-intel ships with Xcode 16.x; while Qt5 is older, Xcode 16 still supports building it
-            # https://developer.apple.com/support/xcode/
-            # https://xcodereleases.com/
-            xcode_version:          16.3.0
-            is_main_build_target:   true
-
-          - config_name:            iOS (artifacts)
-            target_os:              ios
-            building_on_os:         macos-15
-            base_command:           QT_VERSION=5.15.2 ./.github/autobuild/ios.sh
-            # Build failed with CodeQL enabled when last tested 03/2022 (#2490).
-            # There are no hints that iOS is supposed to be supported by CodeQL.
-            # Therefore, disable it:
-            run_codeql:             false
-            xcode_version:          26.2
-
-          - config_name:            Windows (artifact+codeQL)
-            target_os:              windows
-            building_on_os:         windows-2022
-            base_command:           powershell .\.github\autobuild\windows.ps1 -Stage
-            run_codeql:             true
-            is_main_build_target:   true
-
-          - config_name:            Windows JACK (artifact)
-            target_os:              windows
-            building_on_os:         windows-2022
-            base_command:           powershell .\.github\autobuild\windows.ps1 -BuildOption jackonwindows -Stage
-            run_codeql:             false
-
-        # This injects the build_all_targets information into each matrix output:
-        build_all_targets:
-          - ${{ needs.create_release.outputs.build_all_targets }}
-
-        # Exclude all non-main build targets if we are not building for all targets:
-        exclude:
-          - build_all_targets:      'false'  # This is based on a script output and is therefore a string
-            config:
-              is_main_build_target: null
+        config:                     ${{ fromJson(needs.create_release.outputs.build_configs) }}
 
     runs-on:                        ${{ matrix.config.building_on_os }}
     container:                      ${{ matrix.config.building_container }}
@@ -507,4 +553,3 @@ jobs:
           GITHUB_TOKEN:             ${{ secrets.GITHUB_TOKEN }}
         run:                        |
           gh release upload "${{ needs.create_release.outputs.tag_name }}" "repo/InRelease" "repo/key.asc" "repo/Packages" "repo/Release" --clobber -R "${{ github.repository}}"
-
